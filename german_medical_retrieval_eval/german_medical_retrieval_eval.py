@@ -1,7 +1,7 @@
 # # Retrieval evaluation on German cardiology texts
 # Question: for German medical text, does hybrid retrieval (BM25 + embeddings) find the right passage more often than BM25 or embeddings alone?
 # Data: German Wikipedia articles on cardiology and kidney topics. Test set: hand-written questions with the source article and key terms that a relevant passage must contain.
-# Metrics: Hit@k (is a relevant passage in the top k) and MRR (mean of 1 / rank of the first relevant passage). Comparison: paired bootstrap confidence interval over questions.
+# Metrics: Hit@k (is a relevant passage in the top k), Recall@k (share of all relevant passages in the top k) and MRR (mean of 1 / rank of the first relevant passage). Comparison: paired bootstrap confidence interval over questions.
 
 # %%
 # ## 0. Setup
@@ -258,3 +258,105 @@ for qi, item in enumerate(TESTSET):
 # %%
 # ## 8. Chunk size
 # To compare chunk sizes, change `max_words` in `build_chunks` (for example 80 or 300) and re-run sections 2 to 6.
+
+# %%
+# ## 9. Results table
+# Hit@k: is at least one relevant chunk in the top k. Recall@k: share of all relevant chunks that are in the top k, averaged over questions. When a question has many relevant chunks, Recall@k stays low by construction, so read it next to Hit@k. MRR: mean of 1 / rank of the first relevant chunk. The tables and the per-question results are written to `results/`.
+
+# %%
+import os
+os.makedirs("results", exist_ok=True)
+KS = [1, 5, 10]
+
+def recall_at_k(ranking, rel, k):
+    return len(set(ranking[:k]) & rel) / len(rel)
+
+rankings, rows = {}, []
+for qi, item in enumerate(TESTSET):
+    rel = relevant_ids(item, chunks)
+    for name, r in RETRIEVERS.items():
+        ranking = r.rank(item["q"])
+        rankings[(qi, name)] = ranking
+        rank = first_relevant_rank(ranking, rel)
+        row = {"qi": qi, "lang": item["lang"], "retriever": name,
+               "n_relevant": len(rel), "rr": 0.0 if rank is None else 1.0 / rank}
+        for k in KS:
+            row[f"hit@{k}"] = float(rank is not None and rank <= k)
+            row[f"recall@{k}"] = recall_at_k(ranking, rel, k)
+        rows.append(row)
+full = pd.DataFrame(rows)
+full.to_csv("results/retrieval_per_question.csv", index=False)
+
+METRIC_COLS = [f"hit@{k}" for k in KS] + [f"recall@{k}" for k in KS] + ["rr"]
+HEADERS = [f"Hit@{k}" for k in KS] + [f"Recall@{k}" for k in KS] + ["MRR"]
+
+def markdown_table(df, index_names):
+    head = index_names + HEADERS
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for idx, row in df.iterrows():
+        idx = list(idx) if isinstance(idx, tuple) else [idx]
+        lines.append("| " + " | ".join(idx + [f"{row[c]:.3f}" for c in METRIC_COLS]) + " |")
+    return "\n".join(lines)
+
+order = list(RETRIEVERS)
+n_de = sum(t["lang"] == "de" for t in TESTSET)
+n_en = len(TESTSET) - n_de
+overall = full.groupby("retriever")[METRIC_COLS].mean().loc[order]
+by_lang = full.groupby(["lang", "retriever"])[METRIC_COLS].mean()
+by_lang = by_lang.loc[[(l, n) for l in ["de", "en"] for n in order]]
+table_text = (f"All {len(TESTSET)} questions\n\n" + markdown_table(overall, ["Retriever"])
+              + f"\n\nBy question language ({n_de} German, {n_en} English)\n\n"
+              + markdown_table(by_lang, ["Language", "Retriever"]) + "\n")
+open("results/retrieval_table.md", "w", encoding="utf-8").write(table_text)
+print(table_text)
+
+# %%
+# ## 10. Test set audit and input for the RAG step
+# The audit file lists, for every question, how many chunks count as relevant and the first one, so the key-term rule can be checked by reading. The questions in `UNANSWERABLE` ask about topics that are not in the articles, and the script checks that their key terms occur in no chunk. `results/retrieval_for_rag.json` stores the top chunks of every retriever for `rag_eval.py`.
+
+# %%
+UNANSWERABLE = [
+    {"q": "Wie wird eine akute Blinddarmentzündung behandelt?", "absent": ["Appendizitis", "Blinddarm"]},
+    {"q": "Welche Symptome hat Multiple Sklerose?", "absent": ["Multiple Sklerose"]},
+    {"q": "Wie wird ein Bandscheibenvorfall operiert?", "absent": ["Bandscheibe"]},
+    {"q": "Welche Impfungen empfiehlt die STIKO gegen Masern?", "absent": ["Masern", "STIKO"]},
+    {"q": "Was ist ein Kreuzbandriss?", "absent": ["Kreuzband"]},
+    {"q": "Wie wird Schilddrüsenkrebs behandelt?", "absent": ["Schilddrüsenkrebs", "Schilddrüsenkarzinom"]},
+]
+all_text = " ".join(c["text"] for c in chunks).lower()
+unanswerable = []
+for u in UNANSWERABLE:
+    found = [t for t in u["absent"] if t.lower() in all_text]
+    print("kept   " if not found else "dropped", u["q"], found)
+    if not found:
+        unanswerable.append(u)
+
+audit = ["# Test set audit\n"]
+for qi, item in enumerate(TESTSET):
+    rel = sorted(relevant_ids(item, chunks))
+    first = chunks[rel[0]]
+    audit.append(f"## {qi}. {item['q']}\n\nArticle: {item['doc']} | key terms: {item['terms']} | relevant chunks: {len(rel)}\n\n"
+                 f"First relevant chunk ({first['section'] or 'intro'}): {first['text'][:400]}\n")
+open("results/testset_audit.md", "w", encoding="utf-8").write("\n".join(audit))
+
+TOP_K = 5
+
+def pack(c, rel):
+    return {"id": c["id"], "doc": c["doc"], "section": c["section"], "text": c["text"], "relevant": c["id"] in rel}
+
+payload = {"top_k": TOP_K, "questions": [], "unanswerable": []}
+for qi, item in enumerate(TESTSET):
+    rel = relevant_ids(item, chunks)
+    best = next(cid for cid in rankings[(qi, "Hybrid")] if cid in rel)
+    payload["questions"].append({
+        "q": item["q"], "lang": item["lang"], "doc": item["doc"], "terms": item["terms"],
+        "n_relevant": len(rel), "oracle": pack(chunks[best], rel),
+        "retrieved": {n: [pack(chunks[cid], rel) for cid in rankings[(qi, n)][:TOP_K]] for n in RETRIEVERS},
+    })
+for u in unanswerable:
+    payload["unanswerable"].append({
+        "q": u["q"],
+        "retrieved": {n: [pack(chunks[cid], set()) for cid in r.rank(u["q"])[:TOP_K]] for n, r in RETRIEVERS.items()},
+    })
+json.dump(payload, open("results/retrieval_for_rag.json", "w", encoding="utf-8"), ensure_ascii=False)
+print("saved", len(payload["questions"]), "questions and", len(payload["unanswerable"]), "unanswerable questions")

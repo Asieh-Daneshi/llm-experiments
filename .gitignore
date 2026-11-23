@@ -2,3 +2,5 @@ articles.json
 __pycache__/
 *.pyc
 .venv/
+results/retrieval_for_rag.json
+results/rag_generations.jsonl
